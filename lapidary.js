@@ -27,7 +27,7 @@
 
   const STORAGE_KEY = 'lapidary_anthropic_key';
   const POSITION_KEY = 'lapidary_position';
-  const MODEL_ID = 'claude-sonnet-4-20250514';
+  const MODEL_ID = 'claude-sonnet-4-6';
   const MAX_INPUT_CHARS = 10000;
   const REQUEST_TIMEOUT_MS = 60000;
 

@@ -1,15 +1,25 @@
-/* Lapidary v1.1 — a floating prompt refiner
+/* Lapidary v1.2 — a floating prompt refiner
  * Loaded by the Lapidary bookmarklet from GitHub Pages.
  * Single-file, no dependencies. Vanilla JS.
  *
- * v1.1 changes (security & robustness pass):
+ * v1.2 changes:
+ *  - Migrated to Claude Sonnet 4.6 (Sonnet 4 retires June 15, 2026)
+ *  - Session memory: remembers last 5 prompts while panel is open
+ *    so analysis stops asking redundant context questions
+ *  - Memory clears when panel is closed (Esc or X)
+ *  - Raised max_tokens from 1500 to 4000 to prevent JSON truncation
+ *    on long, complex prompts
+ *  - Better error messages distinguish truncation from malformed JSON
+ *  - autocomplete="off" on API key input — kills Chrome password popup
+ *
+ * v1.1 changes (prior):
  *  - 10KB input cap to prevent runaway API costs
  *  - 60s API timeout with abort
  *  - Auto-retry once on 5xx and network errors
  *  - In-flight mutex prevents duplicate concurrent requests
  *  - JSON parse fallback with one repair attempt
  *  - navigator.onLine check before requests
- *  - Position remembered across sessions (localStorage)
+ *  - Position remembered across sessions
  *  - Ctrl/Cmd+Enter to submit
  *  - Focus-stealing bug in input handler fixed
  *  - Speech recognition error backoff
@@ -21,6 +31,8 @@
     const existing = document.getElementById('lapidary-root');
     if (existing) existing.remove();
     window.__lapidaryActive = false;
+    // Also clear session memory when forcibly closed via re-click
+    window.__lapidarySessionMemory = null;
     return;
   }
   window.__lapidaryActive = true;
@@ -30,6 +42,15 @@
   const MODEL_ID = 'claude-sonnet-4-6';
   const MAX_INPUT_CHARS = 10000;
   const REQUEST_TIMEOUT_MS = 60000;
+  const MAX_MEMORY_ITEMS = 5;
+  const ANALYZE_MAX_TOKENS = 1200;
+  const GENERATE_MAX_TOKENS = 4000;
+
+  // Session memory lives on window so it survives re-renders but
+  // dies when the panel is closed.
+  if (!window.__lapidarySessionMemory) {
+    window.__lapidarySessionMemory = [];
+  }
 
   const css = `
     #lapidary-root, #lapidary-root * { box-sizing: border-box; }
@@ -74,6 +95,17 @@
       font-size: 0.6rem;
       color: #9b8eb0;
       letter-spacing: 0.18em;
+    }
+    .lap-memory-badge {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 0.58rem;
+      color: #8b6dc7;
+      letter-spacing: 0.1em;
+      padding: 3px 7px;
+      border-radius: 6px;
+      background: rgba(139, 109, 199, 0.1);
+      border: 1px solid rgba(139, 109, 199, 0.2);
+      margin-left: 6px;
     }
     .lap-close {
       background: none; border: none;
@@ -392,6 +424,32 @@
   };
   state.phase = state.apiKey ? 'input' : 'key';
 
+  // Build a short summary of session memory for prompt context
+  function getSessionMemoryContext() {
+    const memory = window.__lapidarySessionMemory || [];
+    if (memory.length === 0) return '';
+    const items = memory.map((m, i) =>
+      `${i + 1}. [${m.taskType}/${m.complexity}/${m.framework}] User asked: "${m.summary}"`
+    ).join('\n');
+    return `\n\nSESSION CONTEXT — the user has already generated these prompts in the current session. Use this to avoid asking questions whose answers are obvious from prior context (audience, voice, role, project, etc.):\n${items}\n`;
+  }
+
+  function addToSessionMemory(taskType, complexity, framework, rawInput) {
+    // Store a short summary, not the entire prompt, to keep token costs down
+    const summary = rawInput.length > 200 ? rawInput.slice(0, 200) + '...' : rawInput;
+    window.__lapidarySessionMemory.push({
+      taskType,
+      complexity,
+      framework,
+      summary,
+      timestamp: Date.now()
+    });
+    // Keep only the most recent N
+    if (window.__lapidarySessionMemory.length > MAX_MEMORY_ITEMS) {
+      window.__lapidarySessionMemory = window.__lapidarySessionMemory.slice(-MAX_MEMORY_ITEMS);
+    }
+  }
+
   let recognition = null;
   let speechSupported = true;
   let speechErrorCount = 0;
@@ -472,7 +530,8 @@
     const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
     const s = cleaned.indexOf('{');
     const e = cleaned.lastIndexOf('}');
-    if (s === -1 || e === -1) throw new Error('No JSON object found');
+    if (s === -1) throw new Error('TRUNCATED_NO_START');
+    if (e === -1 || e <= s) throw new Error('TRUNCATED_NO_END');
     return JSON.parse(cleaned.slice(s, e + 1));
   }
 
@@ -516,7 +575,9 @@
       }
 
       const data = await response.json();
-      return data.content.filter(c => c.type === 'text').map(c => c.text).join('');
+      const text = data.content.filter(c => c.type === 'text').map(c => c.text).join('');
+      // Return both text and stop_reason so caller can detect truncation
+      return { text, stopReason: data.stop_reason };
     } catch (e) {
       clearTimeout(timeoutId);
       if (e.name === 'AbortError') throw new Error('Request timed out after 60s. Try again.');
@@ -529,15 +590,29 @@
   }
 
   async function callClaudeJSON(prompt, maxTokens) {
-    const text = await callClaude(prompt, maxTokens);
+    const result = await callClaude(prompt, maxTokens);
+    const { text, stopReason } = result;
+
     try {
       return parseJSONStrict(text);
     } catch (e) {
-      const repair = await callClaude(
-        `The following was supposed to be valid JSON but isn't. Return ONLY valid JSON with the same intended structure, no preamble, no markdown:\n\n${text}`,
-        maxTokens
-      );
-      return parseJSONStrict(repair);
+      // Distinguish truncation from malformed JSON for better errors
+      if (stopReason === 'max_tokens') {
+        throw new Error('The response was too long and got cut off. Try breaking your prompt into smaller pieces.');
+      }
+      if (e.message === 'TRUNCATED_NO_END' || e.message === 'TRUNCATED_NO_START') {
+        throw new Error('The response was incomplete. Try again — if it happens repeatedly, try a shorter input.');
+      }
+      // Malformed but complete — try one repair pass
+      try {
+        const repairResult = await callClaude(
+          `The following was supposed to be valid JSON but isn't. Return ONLY valid JSON with the same intended structure, no preamble, no markdown:\n\n${text}`,
+          maxTokens
+        );
+        return parseJSONStrict(repairResult.text);
+      } catch (repairErr) {
+        throw new Error('Could not parse the AI response. Try rephrasing your input.');
+      }
     }
   }
 
@@ -555,13 +630,15 @@
     render();
 
     try {
+      const memoryContext = getSessionMemoryContext();
+
       const parsed = await callClaudeJSON(`You are an expert prompt engineer helping someone turn a rough, often voice-transcribed idea into an excellent AI prompt.
 
 USER'S ROUGH INPUT (may ramble, may have transcription artifacts — be forgiving of these):
 """
 ${state.rawInput}
 """
-
+${memoryContext}
 Analyze this and respond with ONLY a valid JSON object (no markdown fences, no preamble, no trailing text):
 
 {
@@ -577,8 +654,9 @@ Rules:
 - Questions must be SPECIFIC to this task — never generic like "what's your goal?" or "what tone?"
 - Each question answerable in 1-2 sentences
 - If input is already detailed enough, return "questions": []
+- If SESSION CONTEXT is provided above, USE IT — do not ask questions whose answers are clearly established by prior prompts (audience, role, voice, project, etc.). Only ask about things genuinely new to this prompt.
 - Framework guide: CO-STAR for content/comms with audience nuance, RTF for simple direct tasks, RISEN for multi-step work with constraints, Chain-of-Thought for reasoning/analysis, Hybrid for mixed needs
-- Complexity guide: simple = one clear action, no ambiguity. medium = multiple parts or some judgment needed. complex = deep reasoning, multiple constraints, or significant ambiguity.`, 1000);
+- Complexity guide: simple = one clear action, no ambiguity. medium = multiple parts or some judgment needed. complex = deep reasoning, multiple constraints, or significant ambiguity.`, ANALYZE_MAX_TOKENS);
 
       state.taskType = parsed.taskType || 'other';
       state.complexity = parsed.complexity || 'medium';
@@ -595,7 +673,7 @@ Rules:
         state.phase = 'clarifying';
       }
     } catch (e) {
-      state.error = `Could not analyze: ${e.message}`;
+      state.error = e.message;
     }
     state.loading = false;
     state.inFlight = false;
@@ -615,6 +693,8 @@ Rules:
         ? state.questions.map((q, i) => `Q: ${q}\nA: ${state.answers[i] || '(skipped)'}`).join('\n\n')
         : '(no clarifying questions were needed)';
 
+      const memoryContext = getSessionMemoryContext();
+
       const parsed = await callClaudeJSON(`You are an expert prompt engineer. Synthesize a polished, production-quality prompt from this material.
 
 USER'S ROUGH IDEA:
@@ -624,7 +704,7 @@ ${state.rawInput}
 
 CLARIFYING Q&A:
 ${qaSection}
-
+${memoryContext}
 TASK TYPE: ${state.taskType}
 COMPLEXITY: ${state.complexity}
 FRAMEWORK TO APPLY: ${state.framework}
@@ -645,13 +725,18 @@ Framework reference:
 - Chain-of-Thought: Set up explicit reasoning steps
 - Hybrid: Blend elements as needed
 
-Write in second person ("You are...", "Your task...") so it reads naturally when pasted into a fresh chat. Do not include meta-commentary like "Here is your prompt" inside the prompt itself.`, 1500);
+Write in second person ("You are...", "Your task...") so it reads naturally when pasted into a fresh chat. Do not include meta-commentary like "Here is your prompt" inside the prompt itself.
+If SESSION CONTEXT is provided, weave its established details (audience, voice, etc.) into the prompt rather than re-asking them.`, GENERATE_MAX_TOKENS);
 
       state.polishedPrompt = parsed.prompt || '';
       state.promptNotes = parsed.notes || '';
+
+      // Add to session memory after a successful generation
+      addToSessionMemory(state.taskType, state.complexity, state.framework, state.rawInput);
+
       state.phase = 'output';
     } catch (e) {
-      state.error = `Could not generate: ${e.message}`;
+      state.error = e.message;
     }
     state.loading = false;
     state.inFlight = false;
@@ -726,6 +811,8 @@ Write in second person ("You are...", "Your task...") so it reads naturally when
     if (root) root.remove();
     document.getElementById('lapidary-styles')?.remove();
     window.__lapidaryActive = false;
+    // Clear session memory when panel is intentionally closed
+    window.__lapidarySessionMemory = null;
     document.removeEventListener('keydown', keyHandler);
   }
 
@@ -774,11 +861,17 @@ Write in second person ("You are...", "Your task...") so it reads naturally when
       } catch (e) {}
     }
 
+    const memoryCount = (window.__lapidarySessionMemory || []).length;
+    const memoryBadge = memoryCount > 0
+      ? `<span class="lap-memory-badge">${memoryCount}/5 IN MEMORY</span>`
+      : '';
+
     const headerHTML = `
       <div class="lap-header" id="lap-header">
         <div class="lap-title-row">
           <span class="lap-title">Lapidary</span>
           <span class="lap-tag">ROUGH → FACETED</span>
+          ${memoryBadge}
         </div>
         <button class="lap-close" id="lap-close-btn" title="Close (Esc)">×</button>
       </div>
@@ -790,7 +883,7 @@ Write in second person ("You are...", "Your task...") so it reads naturally when
       bodyHTML = `
         <div class="lap-key-prompt">
           <p>Lapidary needs your Anthropic API key to work. Get one at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>. It's stored only in this browser's localStorage.</p>
-          <input type="password" class="lap-key-input" id="lap-key-input" placeholder="sk-ant-..." autocomplete="off" />
+          <input type="password" class="lap-key-input" id="lap-key-input" placeholder="sk-ant-..." autocomplete="off" data-form-type="other" data-lpignore="true" />
           <div class="lap-actions">
             <button class="lap-btn lap-btn-primary" id="lap-key-save">SAVE KEY</button>
           </div>
@@ -889,11 +982,10 @@ Write in second person ("You are...", "Your task...") so it reads naturally when
 
     const footerHTML = `
       <div class="lap-footer">
-        <span>SONNET 4 · ESC TO CLOSE · CTRL+ENTER SUBMITS${state.apiKey ? ' · <a href="#" id="lap-key-clear">RESET KEY</a>' : ''}</span>
+        <span>SONNET 4.6 · ESC TO CLOSE · CTRL+ENTER SUBMITS${state.apiKey ? ' · <a href="#" id="lap-key-clear">RESET KEY</a>' : ''}</span>
       </div>
     `;
 
-    // Preserve focus across re-renders
     const activeId = document.activeElement?.id;
     const activeIdx = document.activeElement?.dataset?.answerIdx;
     const selStart = document.activeElement?.selectionStart;
@@ -930,11 +1022,9 @@ Write in second person ("You are...", "Your task...") so it reads naturally when
         const wasEmpty = state.rawInput.trim() === '';
         const isEmpty = e.target.value.trim() === '';
         state.rawInput = e.target.value;
-        // Only re-render on empty<->non-empty transition (toggles buttons)
         if (wasEmpty !== isEmpty) {
           render();
         } else {
-          // Update char counter in place
           const cc = root.querySelector('.lap-charcount');
           if (state.rawInput.length > 200) {
             const text = `${state.rawInput.length} / ${MAX_INPUT_CHARS}`;
@@ -943,11 +1033,9 @@ Write in second person ("You are...", "Your task...") so it reads naturally when
               cc.textContent = text;
               cc.classList.toggle('warn', warn);
             } else {
-              // Counter wasn't shown but should be now — re-render
               render();
             }
           } else if (cc) {
-            // Crossed back under 200 — re-render to remove counter
             render();
           }
         }
